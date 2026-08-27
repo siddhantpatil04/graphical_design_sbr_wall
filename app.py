@@ -8,6 +8,10 @@ from engine import calculate, default_inputs, linked_wall_thickness_profile, rec
 from models import RebarLayer, WallStationInput
 from pdf_report import build_pdf
 from excel_export import build_excel
+from ui_theme import ADVANCED_UI_CSS
+from ui_graphics import wall_water_advanced_svg, footing_advanced_svg, thickness_profile_advanced_svg
+from ui_components import project_strip, fixed_parameters_panel, legend_panel, quick_help_panel, reinforcement_summary, sidebar_status
+
 from code_basis import (
     CODE_OPTIONS, CODE_1965, CODE_2009, CODE_2021,
     METHOD_LSM, METHOD_WSM, normalise_method, profile,
@@ -239,6 +243,8 @@ button[data-baseweb="tab"][aria-selected="true"] { color: #ff5a5f !important; }
     unsafe_allow_html=True,
 )
 
+
+st.markdown(ADVANCED_UI_CSS, unsafe_allow_html=True)
 
 # ---------- helpers ----------
 def section_title(number: int, text: str) -> None:
@@ -596,6 +602,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+project_strip(base.project)
+
 st.markdown('<div class="input-mode-bar"><b>Input Mode</b> — Graphical mode is intended for draftsmen and occasional users; Detailed mode exposes the full engineering form.</div>', unsafe_allow_html=True)
 input_view = st.radio(
     "Choose how you want to enter the design data",
@@ -613,200 +621,151 @@ ui_v = st.session_state.input_widget_version
 
 if input_view == "🖼 Graphical Input":
     st.markdown(
-        '<div class="draftsman-tip"><b>How to use this view:</b> read the numbered callouts on each sketch, then enter the matching values beside it. The sketches are intentionally simple and are <b>not to scale</b>. Advanced reinforcement remains available in collapsed engineer/checker sections.</div>',
+        '<div class="adv-section-header"><div class="adv-section-title">GRAPHICAL INPUT — WALL, WATER & FOOTING</div><div class="adv-help">ⓘ Match numbered inputs to the same number on the drawings</div></div>',
         unsafe_allow_html=True,
     )
 
-    # ---------- G1. wall / water geometry ----------
-    section_title(1, "Wall & Water Levels")
-    diag, controls = st.columns([1.15, 1.0], gap="large")
-    diagram_slot = diag.empty()
-    with controls:
-        st.markdown("#### Enter the numbered values")
-        base.wall_top_rl_m = st.number_input(
-            "① Top Level of Wall RL (m)", value=float(base.wall_top_rl_m), step=0.05, format="%.3f",
-            key=f"g_wall_top_{ui_v}",
-        )
-        base.water_top_rl_m = st.number_input(
-            "② Top Level of Water RL (m)", value=float(base.water_top_rl_m), step=0.05, format="%.3f",
-            key=f"g_water_top_{ui_v}",
-        )
-        base.raft_top_rl_m = st.number_input(
-            "④ Top Level of Raft RL (m)", value=float(base.raft_top_rl_m), step=0.05, format="%.3f",
-            key=f"g_raft_top_{ui_v}",
-        )
-        with st.expander("More wall geometry", expanded=False):
-            base.freeboard_m = st.number_input(
-                "Freeboard Addition (m)", min_value=0.0, value=float(base.freeboard_m), step=0.05,
-                key=f"g_freeboard_{ui_v}",
+    main_left, main_right = st.columns([2.15, 1.0], gap="medium")
+
+    # ======================== LEFT SIDE: PRIMARY DRAFTSMAN INPUTS ========================
+    with main_left:
+        # --- Wall / liquid section ---
+        with st.container(border=True):
+            input_col, graphic_col = st.columns([0.78, 1.62], gap="medium")
+            with input_col:
+                st.markdown('<div class="adv-panel-title">Wall & Water Inputs</div>', unsafe_allow_html=True)
+                base.wall_top_rl_m = st.number_input(
+                    "① Top of Wall RL (m)", value=float(base.wall_top_rl_m), step=0.05, format="%.3f", key=f"ag_wall_top_{ui_v}",
+                    help="Reduced level at the top of the RCC wall.",
+                )
+                base.water_top_rl_m = st.number_input(
+                    "② Top Water Level RL (m)", value=float(base.water_top_rl_m), step=0.05, format="%.3f", key=f"ag_water_top_{ui_v}",
+                    help="Highest retained liquid level used for this design input.",
+                )
+                base.raft_top_rl_m = st.number_input(
+                    "③ Top of Raft RL (m)", value=float(base.raft_top_rl_m), step=0.05, format="%.3f", key=f"ag_raft_top_{ui_v}",
+                    help="Reduced level at the top surface of the raft/footing reference.",
+                )
+                crack_index = min(range(len(CRACK_WIDTH_OPTIONS)), key=lambda idx: abs(CRACK_WIDTH_OPTIONS[idx] - float(base.crack_limit_mm)))
+                base.crack_limit_mm = st.selectbox(
+                    "Design Crack Width", CRACK_WIDTH_OPTIONS, index=crack_index, key=f"ag_crack_{ui_v}",
+                    format_func=lambda value: f"{value:.2f} mm",
+                )
+                base.wall_cover_mm = st.number_input(
+                    "④ Wall Clear Cover (mm)", min_value=10.0, value=float(base.wall_cover_mm), step=5.0, key=f"ag_wall_cover_{ui_v}",
+                )
+                with st.expander("More wall geometry", expanded=False):
+                    base.freeboard_m = st.number_input("Freeboard Addition (m)", min_value=0.0, value=float(base.freeboard_m), step=0.05, key=f"ag_freeboard_{ui_v}")
+                    base.cutoff_height_m = st.number_input("Special Cut-off Station Height (m)", min_value=0.0, value=float(base.cutoff_height_m), step=0.05, key=f"ag_cutoff_{ui_v}")
+                    base.wall_taper_height_m = st.number_input("Wall Taper Height at Footing (m)", min_value=0.0, value=float(base.wall_taper_height_m), step=0.10, key=f"ag_taper_{ui_v}")
+            with graphic_col:
+                st.markdown(wall_water_advanced_svg(base), unsafe_allow_html=True)
+
+        # --- Material / site inputs kept compact, because they are not dimensions on the section ---
+        with st.expander("Material & site design inputs", expanded=True):
+            if design_code == CODE_1965:
+                concrete_options = [15.0, 20.0, 25.0, 30.0, 35.0, 40.0]
+            elif design_code == CODE_2009:
+                concrete_options = [25.0, 30.0, 35.0, 40.0, 45.0, 50.0]
+            else:
+                concrete_options = [20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0]
+            if float(base.fck_mpa) not in concrete_options:
+                base.fck_mpa = 30.0
+            steel_options = [250.0, 415.0, 500.0, 550.0]
+            if float(base.fy_mpa) not in steel_options:
+                steel_options = sorted(steel_options + [float(base.fy_mpa)])
+            mi1, mi2, mi3, mi4 = st.columns(4)
+            base.fck_mpa = mi1.selectbox("Concrete Grade", concrete_options, index=concrete_options.index(float(base.fck_mpa)), key=f"ag_fck_{ui_v}", format_func=lambda x: f"M{x:g}")
+            base.fy_mpa = mi2.selectbox("Steel Grade", steel_options, index=steel_options.index(float(base.fy_mpa)), key=f"ag_fy_{ui_v}", format_func=lambda x: f"Fe{x:g}")
+            base.sbc_kn_m2 = mi3.number_input("Safe Bearing Capacity (kN/m²)", min_value=1.0, value=float(base.sbc_kn_m2), step=5.0, key=f"ag_sbc_{ui_v}")
+            base.gamma_liquid_kn_m3 = mi4.number_input("Unit Weight of Liquid (kN/m³)", min_value=0.1, value=float(base.gamma_liquid_kn_m3), step=0.5, key=f"ag_gamma_liquid_{ui_v}")
+
+        crack_incompatible = design_method == METHOD_LSM and base.crack_limit_mm > 0.20 + 1e-9
+        if crack_incompatible:
+            st.error(
+                f"{base.crack_limit_mm:.2f} mm is available in the requested dropdown, but the implemented {design_code} "
+                "Limit State basis does not permit a crack-width limit above 0.20 mm. Select 0.20 mm or a stricter value to run."
             )
-            base.cutoff_height_m = st.number_input(
-                "Special Cut-off Station Height (m)", min_value=0.0, value=float(base.cutoff_height_m), step=0.05,
-                key=f"g_cutoff_{ui_v}",
+        elif design_method == METHOD_WSM:
+            st.caption(
+                f"Selected crack-width criterion: {base.crack_limit_mm:.2f} mm. In WSM, acceptance remains governed by the applicable permissible-stress / resistance-to-cracking checks."
             )
-            base.wall_taper_height_m = st.number_input(
-                "Wall Taper Height at Footing (m)", min_value=0.0, value=float(base.wall_taper_height_m), step=0.10,
-                key=f"g_taper_{ui_v}",
+        if design_code == CODE_1965 and base.fy_mpa > 415:
+            st.caption("1965 branch: modern Fe500/Fe550 is checked using the implemented legacy HYSD permissible-stress cap.")
+
+        # --- Footing geometry section ---
+        st.markdown('<div class="adv-panel-title" style="margin-top:.55rem">⑥ Footing Geometry (Section)</div>', unsafe_allow_html=True)
+        with st.container(border=True):
+            st.markdown(footing_advanced_svg(base), unsafe_allow_html=True)
+            fg1, fg2, fg3, fg4, fg5 = st.columns(5)
+            base.toe_projection_m = fg1.number_input("⑥ Toe Projection (m)", min_value=0.10, value=float(base.toe_projection_m), step=0.05, key=f"ag_toe_{ui_v}")
+            base.heel_projection_m = fg2.number_input("⑦ Heel Projection (m)", min_value=0.10, value=float(base.heel_projection_m), step=0.05, key=f"ag_heel_{ui_v}")
+            base.footing_edge_thickness_m = fg3.number_input("⑧ Footing Edge (m)", min_value=0.05, value=float(base.footing_edge_thickness_m), step=0.025, key=f"ag_foot_edge_{ui_v}")
+            base.footing_total_thickness_m = fg4.number_input("⑨ Total Footing (m)", min_value=0.05, value=float(base.footing_total_thickness_m), step=0.025, key=f"ag_foot_total_{st.session_state.thickness_widget_version}_{ui_v}")
+            base.footing_cover_mm = fg5.number_input("⑩ Footing Cover (mm)", min_value=10.0, value=float(base.footing_cover_mm), step=5.0, key=f"ag_foot_cover_{ui_v}")
+
+        # --- Locked parameters / legend / help like the visual mockup ---
+        fp, lg, qh = st.columns([1.35, .68, .90], gap="small")
+        with fp:
+            with st.container(border=True):
+                fixed_parameters_panel(base)
+        with lg:
+            with st.container(border=True):
+                legend_panel()
+        with qh:
+            with st.container(border=True):
+                quick_help_panel()
+
+    # ======================== RIGHT SIDE: PROFILE + REINFORCEMENT ========================
+    with main_right:
+        st.markdown('<div class="adv-panel-title">⑤ Linked Wall Thickness Profile</div>', unsafe_allow_html=True)
+        with st.container(border=True):
+            rows = [{"Station": s.label, "Thickness (mm)": float(s.provided_thickness_mm)} for s in base.wall_stations]
+            profile_key = f"ag_profile_{st.session_state.thickness_widget_version}_{ui_v}"
+            edited_profile = st.data_editor(
+                pd.DataFrame(rows), hide_index=True, use_container_width=True, key=profile_key, disabled=["Station"], num_rows="fixed",
+                column_config={"Thickness (mm)": st.column_config.NumberColumn("Thickness (mm)", min_value=max(50.0,float(base.wall_cover_mm)+1.0), step=1.0, format="%.0f")},
+                height=420,
             )
-    diagram_slot.markdown(_diagram_shell(
-        "Wall / liquid section",
-        "Use the numbered callouts to relate RL inputs to the actual wall. Blue indicates retained liquid.",
-        wall_geometry_svg(base),
-    ), unsafe_allow_html=True)
+            recs = edited_profile.to_dict("records")
+            baseline = [float(s.provided_thickness_mm) for s in base.wall_stations]
+            edited_thks = [float(r["Thickness (mm)"]) for r in recs]
+            diffs = [i for i,(old,new) in enumerate(zip(baseline,edited_thks)) if abs(old-new)>1e-9]
+            if diffs:
+                editor_state = st.session_state.get(profile_key,{})
+                edited_rows_state = editor_state.get("edited_rows",{}) if isinstance(editor_state,dict) else {}
+                changed = [int(i) for i,changes in edited_rows_state.items() if isinstance(changes,dict) and "Thickness (mm)" in changes]
+                edited_index = changed[-1] if changed else diffs[-1]
+                linked_values = linked_wall_thickness_profile(base.wall_stations, edited_index, edited_thks[edited_index])
+                delta = linked_values[edited_index] - baseline[edited_index]
+                for s,linked in zip(base.wall_stations,linked_values):
+                    s.provided_thickness_mm=float(linked)
+                st.session_state.defaults=deepcopy(base)
+                st.session_state.thickness_widget_version += 1
+                st.session_state.recommendation=None
+                st.session_state.linked_profile_notice=(f"Linked profile updated from {base.wall_stations[edited_index].label}: {delta:+.0f} mm applied to every wall station.")
+                st.rerun()
+            st.markdown(thickness_profile_advanced_svg(base.wall_stations), unsafe_allow_html=True)
+            st.caption("Change any one thickness value and the whole approved profile shifts by the same Δ.")
 
-    divider()
+        if st.session_state.linked_profile_notice:
+            st.info(st.session_state.linked_profile_notice)
+            st.session_state.linked_profile_notice = None
 
-    # ---------- G2. materials ----------
-    section_title(2, "Materials & Design Limits")
-    st.caption("These are project/design properties rather than dimensions on the sketch.")
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    if design_code == CODE_1965:
-        concrete_options = [15.0, 20.0, 25.0, 30.0, 35.0, 40.0]
-    elif design_code == CODE_2009:
-        concrete_options = [25.0, 30.0, 35.0, 40.0, 45.0, 50.0]
-    else:
-        concrete_options = [20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0]
-    if float(base.fck_mpa) not in concrete_options:
-        base.fck_mpa = 30.0
-    base.fck_mpa = m1.selectbox(
-        "Concrete fck", concrete_options, index=concrete_options.index(float(base.fck_mpa)),
-        key=f"g_fck_{ui_v}", format_func=lambda x: f"M{x:g}",
-    )
-    steel_options = [250.0, 415.0, 500.0, 550.0]
-    if float(base.fy_mpa) not in steel_options:
-        steel_options = sorted(steel_options + [float(base.fy_mpa)])
-    base.fy_mpa = m2.selectbox(
-        "Steel fy", steel_options, index=steel_options.index(float(base.fy_mpa)),
-        key=f"g_fy_{ui_v}", format_func=lambda x: f"Fe{x:g}",
-    )
-    base.wall_cover_mm = m3.number_input(
-        "Wall Cover (mm)", min_value=10.0, value=float(base.wall_cover_mm), step=5.0, key=f"g_wall_cover_{ui_v}",
-    )
-    base.sbc_kn_m2 = m4.number_input(
-        "SBC (kN/m²)", min_value=1.0, value=float(base.sbc_kn_m2), step=5.0, key=f"g_sbc_{ui_v}",
-    )
-    base.gamma_liquid_kn_m3 = m5.number_input(
-        "Liquid Unit Wt. (kN/m³)", min_value=0.1, value=float(base.gamma_liquid_kn_m3), step=0.5, key=f"g_gamma_liquid_{ui_v}",
-    )
-    crack_index = min(range(len(CRACK_WIDTH_OPTIONS)), key=lambda idx: abs(CRACK_WIDTH_OPTIONS[idx] - float(base.crack_limit_mm)))
-    base.crack_limit_mm = m6.selectbox(
-        "Crack Width", CRACK_WIDTH_OPTIONS, index=crack_index, key=f"g_crack_{ui_v}",
-        format_func=lambda value: f"{value:.2f} mm",
-    )
-    crack_incompatible = design_method == METHOD_LSM and base.crack_limit_mm > 0.20 + 1e-9
-    if crack_incompatible:
-        st.error(
-            f"{base.crack_limit_mm:.2f} mm is available in the requested dropdown, but the implemented {design_code} "
-            "Limit State basis does not permit a crack-width limit above 0.20 mm. Select 0.20 mm or a stricter value to run."
-        )
-    elif design_method == METHOD_WSM:
-        st.caption(
-            f"Selected crack-width criterion: {base.crack_limit_mm:.2f} mm. In WSM, acceptance remains governed by the applicable permissible-stress / resistance-to-cracking checks."
-        )
-    if design_code == CODE_1965 and base.fy_mpa > 415:
-        st.caption("1965 branch: modern Fe500/Fe550 is checked using the implemented legacy HYSD permissible-stress cap.")
-    _render_fixed_parameters(base)
+        st.markdown('<div class="adv-panel-title" style="margin-top:.65rem">⑪ Reinforcement Summary</div>', unsafe_allow_html=True)
+        with st.container(border=True):
+            reinforcement_summary(base)
+            st.caption("Summary only — click the advanced expanders below to edit reinforcement.")
 
-    divider()
-
-    # ---------- G3. linked thickness profile ----------
-    section_title(3, "Linked Wall Thickness Profile")
-    dcol, icol = st.columns([1.1, 1.0], gap="large")
-    profile_slot = dcol.empty()
-    with icol:
-        st.markdown("#### Wall thickness at each level")
-        st.caption("You may edit any one box. The app automatically applies the same change (Δ) to every station so the approved taper/profile shape is preserved.")
-        station_values = []
-        grid = st.columns(3)
-        for idx, s in enumerate(base.wall_stations):
-            with grid[idx % 3]:
-                station_values.append(st.number_input(
-                    f"{s.label} station (mm)",
-                    min_value=max(50.0, float(base.wall_cover_mm) + 1.0),
-                    value=float(s.provided_thickness_mm),
-                    step=1.0,
-                    format="%.0f",
-                    key=f"g_thk_{idx}_{st.session_state.thickness_widget_version}_{ui_v}",
-                    help="Linked wall thickness input.",
-                ))
-
-        baseline = [float(s.provided_thickness_mm) for s in base.wall_stations]
-        diffs = [i for i, (old, new) in enumerate(zip(baseline, station_values)) if abs(old-new) > 1e-9]
-        if diffs:
-            edited_index = diffs[-1]
-            linked_values = linked_wall_thickness_profile(base.wall_stations, edited_index, station_values[edited_index])
-            delta = linked_values[edited_index] - baseline[edited_index]
-            for s, linked in zip(base.wall_stations, linked_values):
-                s.provided_thickness_mm = float(linked)
-            st.session_state.defaults = deepcopy(base)
-            st.session_state.thickness_widget_version += 1
-            st.session_state.recommendation = None
-            st.session_state.linked_profile_notice = (
-                f"Linked wall profile updated from {base.wall_stations[edited_index].label}: {delta:+.0f} mm applied to every wall-thickness station."
-            )
-            st.rerun()
-
-    profile_slot.markdown(_diagram_shell(
-        "Wall thickness profile",
-        "The silhouette widens with thickness. Every station remains linked to the same approved profile shape.",
-        thickness_profile_svg(base.wall_stations),
-    ), unsafe_allow_html=True)
-
-    if st.session_state.linked_profile_notice:
-        st.info(st.session_state.linked_profile_notice)
-        st.session_state.linked_profile_notice = None
-
-    with st.expander("🧰 Advanced wall reinforcement — engineer / checker use", expanded=False):
-        st.caption("A draftsman normally does not need to change this table unless instructed by the designer.")
-        _wall_rebar_editor(base, key=f"g_wall_rebar_{ui_v}")
-
-    divider()
-
-    # ---------- G4. footing ----------
-    section_title(4, "Wall Footing")
-    fdiag, fcontrols = st.columns([1.15, 1.0], gap="large")
-    footing_slot = fdiag.empty()
-    with fcontrols:
-        st.markdown("#### Enter the footing dimensions")
-        fc1, fc2 = st.columns(2)
-        base.toe_projection_m = fc1.number_input(
-            "① Toe Projection (m)", min_value=0.10, value=float(base.toe_projection_m), step=0.05,
-            key=f"g_toe_{ui_v}",
-        )
-        base.heel_projection_m = fc2.number_input(
-            "② Heel Projection (m)", min_value=0.10, value=float(base.heel_projection_m), step=0.05,
-            key=f"g_heel_{ui_v}",
-        )
-        fc1, fc2 = st.columns(2)
-        base.footing_total_thickness_m = fc1.number_input(
-            "③ Total Footing Thickness (m)", min_value=0.05, value=float(base.footing_total_thickness_m), step=0.025,
-            key=f"g_foot_total_{st.session_state.thickness_widget_version}_{ui_v}",
-        )
-        base.footing_edge_thickness_m = fc2.number_input(
-            "Footing Edge Thickness (m)", min_value=0.05, value=float(base.footing_edge_thickness_m), step=0.025,
-            key=f"g_foot_edge_{ui_v}",
-        )
-        base.footing_cover_mm = st.number_input(
-            "Footing Clear Cover (mm)", min_value=10.0, value=float(base.footing_cover_mm), step=5.0,
-            key=f"g_foot_cover_{ui_v}",
-        )
-    footing_slot.markdown(_diagram_shell(
-        "Toe / wall / heel section",
-        "Toe is the projection on the outside side; heel is the projection behind the wall on the retained-liquid side used by this W1 footing model.",
-        footing_svg(base),
-    ), unsafe_allow_html=True)
-
-    with st.expander("🧰 Advanced footing reinforcement — engineer / checker use", expanded=False):
-        c1, c2 = st.columns(2)
-        with c1:
-            base.footing_top_layers = edit_layers("Top reinforcement", base.footing_top_layers, f"g_ftop_{ui_v}")
-        with c2:
-            base.footing_bottom_layers = edit_layers("Bottom reinforcement", base.footing_bottom_layers, f"g_fbot_{ui_v}")
-        c1, c2 = st.columns(2)
-        with c1:
-            base.footing_distribution_top = edit_layers("Top distribution reinforcement", base.footing_distribution_top, f"g_fdtop_{ui_v}")
-        with c2:
-            base.footing_distribution_bottom = edit_layers("Bottom distribution reinforcement", base.footing_distribution_bottom, f"g_fdbot_{ui_v}")
+        with st.expander("Advanced wall reinforcement — engineer / checker", expanded=False):
+            _wall_rebar_editor(base, key=f"ag_wall_rebar_{ui_v}")
+        with st.expander("Advanced footing reinforcement — engineer / checker", expanded=False):
+            c1,c2=st.columns(2)
+            with c1: base.footing_top_layers=edit_layers("Top reinforcement",base.footing_top_layers,f"ag_ftop_{ui_v}")
+            with c2: base.footing_bottom_layers=edit_layers("Bottom reinforcement",base.footing_bottom_layers,f"ag_fbot_{ui_v}")
+            c1,c2=st.columns(2)
+            with c1: base.footing_distribution_top=edit_layers("Top distribution reinforcement",base.footing_distribution_top,f"ag_fdtop_{ui_v}")
+            with c2: base.footing_distribution_bottom=edit_layers("Bottom distribution reinforcement",base.footing_distribution_bottom,f"ag_fdbot_{ui_v}")
 
 else:
     # ---------- Detailed engineering input view ----------
@@ -928,7 +887,8 @@ if st.session_state.last_fp is not None and st.session_state.last_fp != current_
 st.markdown("<div style='height:.65rem'></div>", unsafe_allow_html=True)
 c_run, c_restore = st.columns([5, 1])
 run_clicked = c_run.button(
-    "⚙  Run Design Calculation",
+    "▶  RUN DESIGN CALCULATION",
+    key="advanced_run_button",
     type="primary",
     use_container_width=True,
     disabled=crack_incompatible,
@@ -957,6 +917,8 @@ if st.session_state.safe_apply_notice:
         st.warning(notice)
 
 fresh = st.session_state.last_result is not None and st.session_state.last_fp == current_fp
+with st.sidebar:
+    sidebar_status(fresh, st.session_state.last_result)
 if st.session_state.last_result is not None and not fresh:
     st.markdown(
         '<div class="status-stale">Inputs or the design-code selection changed after the previous run. The previous result is invalidated. Click <b>Run Design Calculation</b> for the current inputs.</div>',
