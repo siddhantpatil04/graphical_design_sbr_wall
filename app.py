@@ -390,32 +390,39 @@ def footing_svg(inp) -> str:
 
 
 def thickness_profile_svg(stations: list[WallStationInput]) -> str:
+    """Wall profile with a fixed vertical liquid/heel face and taper only on toe side."""
     values = [float(s.provided_thickness_mm) for s in stations]
     mn, mx = min(values), max(values)
     spread = max(mx - mn, 1.0)
     y_top, y_bottom = 50.0, 435.0
     n = max(len(stations) - 1, 1)
-    center = 330.0
-    left_points, right_points = [], []
+
+    # Keep the retained-liquid / HEEL face fixed and vertical.
+    # Only the outer / TOE face moves as the provided thickness changes.
+    heel_face_x = 285.0
+    right_points = []
     labels = []
     for idx, (s, t) in enumerate(zip(stations, values)):
         y = y_top + (y_bottom - y_top) * idx / n
-        half = 34.0 + 72.0 * (t - mn) / spread
-        left_points.append(f"{center-half:.1f},{y:.1f}")
-        right_points.append(f"{center+half:.1f},{y:.1f}")
+        width_px = 68.0 + 144.0 * (t - mn) / spread
+        toe_face_x = heel_face_x + width_px
+        right_points.append(f"{toe_face_x:.1f},{y:.1f}")
         labels.append(
-            f'<line x1="{center+half+8:.1f}" y1="{y:.1f}" x2="545" y2="{y:.1f}" stroke="#374151" stroke-width="1"/>'
+            f'<line x1="{toe_face_x+8:.1f}" y1="{y:.1f}" x2="545" y2="{y:.1f}" stroke="#374151" stroke-width="1"/>'
             f'<text x="555" y="{y+5:.1f}" fill="#d1d5db" font-size="12">{s.label}: {t:.0f} mm</text>'
         )
+
+    left_points = [f"{heel_face_x:.1f},{y_top + (y_bottom-y_top)*idx/n:.1f}" for idx in range(len(stations))]
     polygon = " ".join(left_points + list(reversed(right_points)))
     return f"""
 <svg viewBox="0 0 720 485" width="100%" role="img" aria-label="Linked wall thickness profile">
   <rect x="20" y="16" width="680" height="450" rx="12" fill="#0b0f15" stroke="#29303a"/>
   <text x="42" y="43" fill="#9ca3af" font-size="15">LINKED WALL THICKNESS PROFILE</text>
+  <text x="95" y="72" fill="#93c5fd" font-size="12" font-weight="700">LIQUID / HEEL SIDE — VERTICAL FACE</text>
   <polygon points="{polygon}" fill="#7b8491" stroke="#e5e7eb" stroke-width="2"/>
-  <line x1="330" y1="48" x2="330" y2="440" stroke="#d1d5db" stroke-width="1" stroke-dasharray="5 5" opacity=".45"/>
+  <line x1="{heel_face_x:.1f}" y1="48" x2="{heel_face_x:.1f}" y2="440" stroke="#60a5fa" stroke-width="2" opacity=".85"/>
   {''.join(labels)}
-  <text x="48" y="452" fill="#8f969f" font-size="13">Edit any one station; the same change is applied to every station.</text>
+  <text x="48" y="452" fill="#8f969f" font-size="13">Heel face stays vertical; only the toe face tapers. Each edit changes the linked profile by the same amount.</text>
 </svg>
 """
 
@@ -732,7 +739,7 @@ if input_view == "🖼 Graphical Input":
                     f"{s.label} station (mm)",
                     min_value=max(50.0, float(base.wall_cover_mm) + 1.0),
                     value=float(s.provided_thickness_mm),
-                    step=1.0,
+                    step=5.0,
                     format="%.0f",
                     key=f"g_thk_{idx}_{st.session_state.thickness_widget_version}_{ui_v}",
                     help="Linked wall thickness input.",
@@ -756,7 +763,7 @@ if input_view == "🖼 Graphical Input":
 
     profile_slot.markdown(_diagram_shell(
         "Wall thickness profile",
-        "The silhouette widens with thickness. Every station remains linked to the same approved profile shape.",
+        "The liquid/heel face remains vertical while the opposite/toe face follows the linked thickness profile. Every station remains linked to the approved profile shape.",
         thickness_profile_svg(base.wall_stations),
     ), unsafe_allow_html=True)
 
@@ -875,7 +882,7 @@ else:
         editor_key = f"d_wall_schedule_{st.session_state.thickness_widget_version}_{ui_v}"
         edited = st.data_editor(
             pd.DataFrame(rows), hide_index=True, use_container_width=True, key=editor_key, disabled=["Station"], num_rows="fixed",
-            column_config={"Thickness (mm)": st.column_config.NumberColumn("Thickness (mm)", min_value=max(50.0, float(base.wall_cover_mm)+1.0), step=1.0, format="%.0f")},
+            column_config={"Thickness (mm)": st.column_config.NumberColumn("Thickness (mm)", min_value=max(50.0, float(base.wall_cover_mm)+1.0), step=5.0, format="%.0f")},
         )
         recs = edited.to_dict("records")
         baseline = [float(s.provided_thickness_mm) for s in base.wall_stations]
