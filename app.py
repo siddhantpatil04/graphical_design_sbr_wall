@@ -4,7 +4,7 @@ from copy import deepcopy
 import pandas as pd
 import streamlit as st
 
-from engine import calculate, default_inputs, linked_wall_thickness_profile, recommend_safe_thickness
+from engine import calculate, default_inputs, recommend_safe_thickness
 from models import RebarLayer, WallStationInput
 from pdf_report import build_pdf
 from excel_export import build_excel
@@ -284,9 +284,135 @@ def _diagram_shell(title: str, subtitle: str, svg: str) -> str:
 """
 
 
+def _wall_total_height_m(inp) -> float:
+    """Visible wall height used by the calculation engine, measured top to wall/footing junction."""
+    side_wall_bottom_rl = float(inp.raft_top_rl_m) + (
+        float(inp.footing_total_thickness_m) - float(inp.footing_edge_thickness_m)
+    )
+    return max(float(inp.wall_top_rl_m) - side_wall_bottom_rl, 1e-9)
+
+
+def _taper_start_percent(inp) -> float:
+    """Return taper-start level as % of wall height measured downward from the top."""
+    total_h = _wall_total_height_m(inp)
+    taper_h = max(0.0, min(float(inp.wall_taper_height_m), total_h))
+    return max(0.0, min(100.0, 100.0 * (1.0 - taper_h / total_h)))
+
+
+def _station_fraction_from_top(inp, station: WallStationInput) -> float:
+    if station.fraction is not None:
+        return max(0.0, min(1.0, float(station.fraction)))
+    if station.special_height_m is not None:
+        return max(0.0, min(1.0, float(station.special_height_m) / _wall_total_height_m(inp)))
+    return 0.0
+
+
+def _apply_single_taper_profile(inp, top_mm: float, bottom_mm: float, taper_start_pct: float) -> None:
+    """Generate one wall taper only: constant top zone, then one linear taper to the bottom.
+
+    `taper_start_pct` is measured from the top. Example: 60 means the top 60% is
+    constant at `top_mm`, and only the lower 40% tapers linearly to `bottom_mm`.
+    The existing engine's wall_taper_height_m is kept synchronized for stability weight.
+    """
+    top_mm = float(top_mm)
+    bottom_mm = float(bottom_mm)
+    taper_start_pct = max(0.0, min(100.0, float(taper_start_pct)))
+    start_f = taper_start_pct / 100.0
+    total_h = _wall_total_height_m(inp)
+    inp.wall_taper_height_m = total_h * max(0.0, 1.0 - start_f)
+
+    for station in inp.wall_stations:
+        f = _station_fraction_from_top(inp, station)
+        if f <= start_f + 1e-12:
+            thickness = top_mm
+        elif start_f >= 1.0 - 1e-12:
+            thickness = bottom_mm if f >= 1.0 - 1e-12 else top_mm
+        else:
+            local = (f - start_f) / (1.0 - start_f)
+            thickness = top_mm + (bottom_mm - top_mm) * local
+        station.provided_thickness_mm = float(thickness)
+
+    # Keep the end stations exact even if a custom schedule has unusual fractions.
+    if inp.wall_stations:
+        inp.wall_stations[0].provided_thickness_mm = top_mm
+        inp.wall_stations[-1].provided_thickness_mm = bottom_mm
+
+
+def _wall_outline(inp, x_liquid: float, y_top: float, y_bottom: float, max_width_px: float) -> tuple[str, float, float, float, float]:
+    """Return a shared single-taper polygon used by every graphical wall sketch."""
+    top_mm = float(inp.wall_stations[0].provided_thickness_mm)
+    bottom_mm = float(inp.wall_stations[-1].provided_thickness_mm)
+    max_t = max(top_mm, bottom_mm, 1.0)
+    scale = max_width_px / max_t
+    top_w = max(28.0, top_mm * scale)
+    bottom_w = max(28.0, bottom_mm * scale)
+    start_f = _taper_start_percent(inp) / 100.0
+    y_start = y_top + (y_bottom - y_top) * start_f
+    points = (
+        f"{x_liquid:.1f},{y_top:.1f} "
+        f"{x_liquid+top_w:.1f},{y_top:.1f} "
+        f"{x_liquid+top_w:.1f},{y_start:.1f} "
+        f"{x_liquid+bottom_w:.1f},{y_bottom:.1f} "
+        f"{x_liquid:.1f},{y_bottom:.1f}"
+    )
+    return points, y_start, top_w, bottom_w, start_f
+
+
+def _render_wall_profile_controls(inp, key_prefix: str, ui_v: int) -> tuple[float, float, float]:
+    """Shared Top / Bottom / Taper controls for Graphical and Detailed input views."""
+    current_top = float(inp.wall_stations[0].provided_thickness_mm)
+    current_bottom = float(inp.wall_stations[-1].provided_thickness_mm)
+    current_start = float(st.session_state.get("wall_taper_start_pct", _taper_start_percent(inp)))
+    min_thk = max(50.0, float(inp.wall_cover_mm) + 1.0)
+
+    c1, c2, c3 = st.columns(3)
+    top_mm = c1.number_input(
+        "Top Wall Thickness (mm)", min_value=min_thk, value=current_top, step=5.0, format="%.0f",
+        key=f"{key_prefix}_top_thk_{st.session_state.thickness_widget_version}_{ui_v}",
+        help="Constant wall thickness above the taper-start level.",
+    )
+    bottom_mm = c2.number_input(
+        "Bottom Wall Thickness (mm)", min_value=min_thk, value=current_bottom, step=5.0, format="%.0f",
+        key=f"{key_prefix}_bottom_thk_{st.session_state.thickness_widget_version}_{ui_v}",
+        help="Wall thickness at the wall/footing junction.",
+    )
+    taper_start_pct = c3.number_input(
+        "Taper Starts Below (% from Top)", min_value=0.0, max_value=100.0, value=current_start,
+        step=5.0, format="%.0f", key=f"{key_prefix}_taper_start_{st.session_state.thickness_widget_version}_{ui_v}",
+        help="Example: enter 60 to keep 0–60% constant at the top thickness and taper only from 60–100% down to the bottom thickness.",
+    )
+
+    if bottom_mm < top_mm:
+        st.error("Bottom Wall Thickness must be greater than or equal to Top Wall Thickness for this single-taper wall geometry.")
+        return current_top, current_bottom, current_start
+
+    before = [float(s.provided_thickness_mm) for s in inp.wall_stations]
+    old_taper_h = float(inp.wall_taper_height_m)
+    _apply_single_taper_profile(inp, float(top_mm), float(bottom_mm), float(taper_start_pct))
+    after = [float(s.provided_thickness_mm) for s in inp.wall_stations]
+    profile_changed = (
+        any(abs(a-b) > 1e-8 for a, b in zip(before, after))
+        or abs(old_taper_h - float(inp.wall_taper_height_m)) > 1e-8
+        or abs(float(taper_start_pct) - current_start) > 1e-8
+    )
+    if profile_changed:
+        st.session_state.wall_taper_start_pct = float(taper_start_pct)
+        st.session_state.defaults = deepcopy(inp)
+        st.session_state.recommendation = None
+        st.session_state.linked_profile_notice = (
+            f"Single wall profile updated: {top_mm:.0f} mm top thickness remains constant to "
+            f"{taper_start_pct:.0f}% from the top; one linear taper then reaches {bottom_mm:.0f} mm at the bottom."
+        )
+        st.rerun()
+
+    return float(top_mm), float(bottom_mm), float(taper_start_pct)
+
+
 def wall_geometry_svg(inp) -> str:
-    """Simple not-to-scale wall / water / raft section for draftsman input guidance."""
+    """Wall / water / raft section using the same single-taper geometry as Diagram 2."""
     liquid_depth = max(inp.water_top_rl_m - (inp.raft_top_rl_m + inp.footing_total_thickness_m - inp.footing_edge_thickness_m) + inp.freeboard_m, 0.0)
+    wall_points, taper_y, _, _, taper_f = _wall_outline(inp, 365.0, 78.0, 365.0, 83.0)
+    taper_pct = taper_f * 100.0
     return f"""
 <svg viewBox="0 0 720 455" width="100%" role="img" aria-label="Wall and water level input schematic">
   <defs>
@@ -297,21 +423,20 @@ def wall_geometry_svg(inp) -> str:
     <linearGradient id="concreteFill" x1="0" y1="0" x2="1" y2="0">
       <stop offset="0%" stop-color="#6b7280"/><stop offset="100%" stop-color="#9ca3af"/>
     </linearGradient>
-    <marker id="arrow" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto" markerUnits="strokeWidth">
-      <path d="M0,0 L8,4 L0,8 z" fill="#d1d5db"/>
-    </marker>
   </defs>
   <rect x="20" y="16" width="680" height="420" rx="12" fill="#0b0f15" stroke="#29303a"/>
   <text x="42" y="45" fill="#9ca3af" font-size="15">SECTION — NOT TO SCALE</text>
 
-  <!-- retained liquid / HEEL side: left face of wall is vertical -->
+  <!-- liquid side is always on the left of the fixed vertical wall face -->
   <polygon points="70,155 365,155 365,365 70,365" fill="url(#waterFill)"/>
   <path d="M70 155 Q90 147 110 155 T150 155 T190 155 T230 155 T270 155 T310 155 T350 155" fill="none" stroke="#60a5fa" stroke-width="4"/>
-  <text x="112" y="190" fill="#bfdbfe" font-size="20" font-weight="700">LIQUID / HEEL SIDE</text>
+  <text x="112" y="190" fill="#bfdbfe" font-size="20" font-weight="700">LIQUID SIDE</text>
   <text x="112" y="214" fill="#93c5fd" font-size="14">Depth ~ {liquid_depth:.2f} m</text>
 
-  <!-- wall: vertical on liquid / heel face, tapered only on outer / toe face -->
-  <polygon points="365,78 414,78 448,365 365,365" fill="url(#concreteFill)" stroke="#d1d5db" stroke-width="2"/>
+  <!-- exact same single-taper wall profile used in the linked-thickness diagram -->
+  <polygon points="{wall_points}" fill="url(#concreteFill)" stroke="#d1d5db" stroke-width="2"/>
+  <line x1="365" y1="{taper_y:.1f}" x2="465" y2="{taper_y:.1f}" stroke="#fbbf24" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="470" y="{taper_y+5:.1f}" fill="#fbbf24" font-size="11">Taper below {taper_pct:.0f}%</text>
   <text x="395" y="230" fill="#111827" font-size="18" font-weight="800" transform="rotate(90 395,230)">RCC WALL W1</text>
 
   <!-- footing / raft -->
@@ -327,7 +452,6 @@ def wall_geometry_svg(inp) -> str:
   <circle cx="483" cy="142" r="13" fill="#2563eb"/><text x="483" y="147" text-anchor="middle" fill="white" font-size="13" font-weight="800">2</text>
   <text x="503" y="147" fill="#ffffff" font-size="14">Top Water RL = {inp.water_top_rl_m:.3f} m</text>
 
-  <!-- Top of Raft is at the wall / raft junction; side-wall-bottom label intentionally omitted -->
   <line x1="448" y1="365" x2="650" y2="365" stroke="#34d399" stroke-width="2" stroke-dasharray="6 5"/>
   <circle cx="483" cy="352" r="13" fill="#059669"/><text x="483" y="357" text-anchor="middle" fill="white" font-size="13" font-weight="800">3</text>
   <text x="503" y="357" fill="#ffffff" font-size="14">Top of Raft RL = {inp.raft_top_rl_m:.3f} m</text>
@@ -341,14 +465,14 @@ def footing_svg(inp) -> str:
     heel = float(inp.heel_projection_m)
     toe = float(inp.toe_projection_m)
     wall = max(float(inp.wall_stations[-1].provided_thickness_mm) / 1000.0, 0.05)
-    # Drawing orientation is intentionally consistent with Diagram 1:
-    # retained liquid / HEEL = LEFT, outer / TOE = RIGHT.
     total = max(heel + toe + wall, 0.1)
     x0, width = 70.0, 570.0
     heel_px = width * heel / total
     wall_px = max(width * wall / total, 42.0)
     wall_x = x0 + heel_px
+    wall_points, taper_y, _, _, taper_f = _wall_outline(inp, wall_x, 90.0, 245.0, wall_px)
     wall_center = wall_x + wall_px / 2.0
+    taper_pct = taper_f * 100.0
     return f"""
 <svg viewBox="0 0 720 390" width="100%" role="img" aria-label="Footing heel and toe projection schematic">
   <defs>
@@ -363,69 +487,71 @@ def footing_svg(inp) -> str:
   <rect x="20" y="16" width="680" height="350" rx="12" fill="#0b0f15" stroke="#29303a"/>
   <text x="42" y="45" fill="#9ca3af" font-size="15">FOOTING SECTION — NOT TO SCALE</text>
 
-  <!-- liquid / HEEL side is consistently shown on the LEFT -->
   <polygon points="70,118 {wall_x:.1f},118 {wall_x:.1f},245 70,245" fill="url(#waterFoot)"/>
   <path d="M70 118 Q90 111 110 118 T150 118 T190 118 T230 118 T270 118 T310 118" fill="none" stroke="#60a5fa" stroke-width="3"/>
-  <text x="92" y="150" fill="#bfdbfe" font-size="15" font-weight="700">LIQUID / HEEL SIDE</text>
+  <text x="92" y="150" fill="#bfdbfe" font-size="15" font-weight="700">LIQUID SIDE</text>
 
   <rect x="70" y="245" width="570" height="70" fill="#7b8491" stroke="#d1d5db" stroke-width="2"/>
-  <!-- vertical on liquid/heel face; tapered on outer/toe face -->
-  <polygon points="{wall_x:.1f},90 {wall_x+wall_px:.1f},90 {wall_x+wall_px+18:.1f},245 {wall_x:.1f},245" fill="#9ca3af" stroke="#e5e7eb" stroke-width="2"/>
+  <polygon points="{wall_points}" fill="#9ca3af" stroke="#e5e7eb" stroke-width="2"/>
+  <line x1="{wall_x:.1f}" y1="{taper_y:.1f}" x2="{wall_x+wall_px+24:.1f}" y2="{taper_y:.1f}" stroke="#fbbf24" stroke-width="1.2" stroke-dasharray="4 4"/>
+  <text x="{wall_x+wall_px+28:.1f}" y="{taper_y+4:.1f}" fill="#fbbf24" font-size="10">{taper_pct:.0f}%</text>
   <text x="{wall_center:.1f}" y="166" text-anchor="middle" fill="#111827" font-size="18" font-weight="800" transform="rotate(90 {wall_center:.1f},166)">W1 WALL</text>
 
   <line x1="72" y1="222" x2="{wall_x-4:.1f}" y2="222" stroke="#60a5fa" stroke-width="2" marker-start="url(#a2)" marker-end="url(#a2)"/>
   <circle cx="120" cy="196" r="13" fill="#2563eb"/><text x="120" y="201" text-anchor="middle" fill="white" font-size="13" font-weight="800">1</text>
-  <text x="143" y="201" fill="#ffffff" font-size="15" font-weight="700">HEEL = {heel:.2f} m</text>
+  <text x="143" y="201" fill="#ffffff" font-size="15" font-weight="700">HEEL SIDE = {heel:.2f} m</text>
 
   <line x1="{wall_x+wall_px+4:.1f}" y1="222" x2="638" y2="222" stroke="#34d399" stroke-width="2" marker-start="url(#a2)" marker-end="url(#a2)"/>
   <circle cx="520" cy="196" r="13" fill="#059669"/><text x="520" y="201" text-anchor="middle" fill="white" font-size="13" font-weight="800">2</text>
-  <text x="543" y="201" fill="#ffffff" font-size="15" font-weight="700">TOE = {toe:.2f} m</text>
+  <text x="543" y="201" fill="#ffffff" font-size="15" font-weight="700">TOE SIDE = {toe:.2f} m</text>
 
   <line x1="660" y1="245" x2="660" y2="315" stroke="#fbbf24" stroke-width="2" marker-start="url(#a2)" marker-end="url(#a2)"/>
   <circle cx="644" cy="278" r="13" fill="#d97706"/><text x="644" y="283" text-anchor="middle" fill="white" font-size="13" font-weight="800">3</text>
   <text x="430" y="338" fill="#ffffff" font-size="14">Thickness = {inp.footing_total_thickness_m*1000:.0f} mm</text>
-
-  </svg>
-"""
-
-
-def thickness_profile_svg(stations: list[WallStationInput]) -> str:
-    """Wall profile with a fixed vertical liquid/heel face and taper only on toe side."""
-    values = [float(s.provided_thickness_mm) for s in stations]
-    mn, mx = min(values), max(values)
-    spread = max(mx - mn, 1.0)
-    y_top, y_bottom = 50.0, 435.0
-    n = max(len(stations) - 1, 1)
-
-    # Keep the retained-liquid / HEEL face fixed and vertical.
-    # Only the outer / TOE face moves as the provided thickness changes.
-    heel_face_x = 285.0
-    right_points = []
-    labels = []
-    for idx, (s, t) in enumerate(zip(stations, values)):
-        y = y_top + (y_bottom - y_top) * idx / n
-        width_px = 68.0 + 144.0 * (t - mn) / spread
-        toe_face_x = heel_face_x + width_px
-        right_points.append(f"{toe_face_x:.1f},{y:.1f}")
-        labels.append(
-            f'<line x1="{toe_face_x+8:.1f}" y1="{y:.1f}" x2="545" y2="{y:.1f}" stroke="#374151" stroke-width="1"/>'
-            f'<text x="555" y="{y+5:.1f}" fill="#d1d5db" font-size="12">{s.label}: {t:.0f} mm</text>'
-        )
-
-    left_points = [f"{heel_face_x:.1f},{y_top + (y_bottom-y_top)*idx/n:.1f}" for idx in range(len(stations))]
-    polygon = " ".join(left_points + list(reversed(right_points)))
-    return f"""
-<svg viewBox="0 0 720 485" width="100%" role="img" aria-label="Linked wall thickness profile">
-  <rect x="20" y="16" width="680" height="450" rx="12" fill="#0b0f15" stroke="#29303a"/>
-  <text x="42" y="43" fill="#9ca3af" font-size="15">LINKED WALL THICKNESS PROFILE</text>
-  <text x="95" y="72" fill="#93c5fd" font-size="12" font-weight="700">LIQUID / HEEL SIDE — VERTICAL FACE</text>
-  <polygon points="{polygon}" fill="#7b8491" stroke="#e5e7eb" stroke-width="2"/>
-  <line x1="{heel_face_x:.1f}" y1="48" x2="{heel_face_x:.1f}" y2="440" stroke="#60a5fa" stroke-width="2" opacity=".85"/>
-  {''.join(labels)}
-  <text x="48" y="452" fill="#8f969f" font-size="13">Heel face stays vertical; only the toe face tapers. Each edit changes the linked profile by the same amount.</text>
 </svg>
 """
 
+
+def thickness_profile_svg(inp) -> str:
+    """Single-taper wall profile: constant top, one toe-side taper, fixed vertical liquid face."""
+    stations = inp.wall_stations
+    values = [float(s.provided_thickness_mm) for s in stations]
+    top_mm = values[0]
+    bottom_mm = values[-1]
+    y_top, y_bottom = 60.0, 425.0
+    heel_face_x = 260.0
+    wall_points, taper_y, top_w, bottom_w, taper_f = _wall_outline(inp, heel_face_x, y_top, y_bottom, 155.0)
+    taper_pct = taper_f * 100.0
+
+    labels = []
+    for s, t in zip(stations, values):
+        f = _station_fraction_from_top(inp, s)
+        y = y_top + (y_bottom - y_top) * f
+        if f <= taper_f + 1e-12:
+            toe_x = heel_face_x + top_w
+        elif taper_f >= 1.0 - 1e-12:
+            toe_x = heel_face_x + (bottom_w if f >= 1.0 - 1e-12 else top_w)
+        else:
+            local = (f - taper_f) / (1.0 - taper_f)
+            toe_x = heel_face_x + top_w + (bottom_w - top_w) * local
+        labels.append(
+            f'<line x1="{toe_x+8:.1f}" y1="{y:.1f}" x2="540" y2="{y:.1f}" stroke="#374151" stroke-width="1"/>'
+            f'<text x="550" y="{y+4:.1f}" fill="#d1d5db" font-size="11">{s.label}: {t:.0f} mm</text>'
+        )
+
+    return f"""
+<svg viewBox="0 0 720 485" width="100%" role="img" aria-label="Single taper wall thickness profile">
+  <rect x="20" y="16" width="680" height="450" rx="12" fill="#0b0f15" stroke="#29303a"/>
+  <text x="42" y="43" fill="#9ca3af" font-size="15">LINKED WALL THICKNESS PROFILE</text>
+  <text x="72" y="82" fill="#93c5fd" font-size="12" font-weight="700">LIQUID SIDE — VERTICAL FACE</text>
+  <polygon points="{wall_points}" fill="#7b8491" stroke="#e5e7eb" stroke-width="2"/>
+  <line x1="{heel_face_x:.1f}" y1="{y_top-5:.1f}" x2="{heel_face_x:.1f}" y2="{y_bottom+5:.1f}" stroke="#60a5fa" stroke-width="2" opacity=".85"/>
+  <line x1="{heel_face_x-15:.1f}" y1="{taper_y:.1f}" x2="{heel_face_x+max(top_w,bottom_w)+20:.1f}" y2="{taper_y:.1f}" stroke="#fbbf24" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="42" y="{taper_y-7:.1f}" fill="#fbbf24" font-size="11" font-weight="700">TAPER START = {taper_pct:.0f}% FROM TOP</text>
+  {''.join(labels)}
+  <text x="48" y="452" fill="#8f969f" font-size="12">Top = {top_mm:.0f} mm constant above taper point; one linear taper below it; Bottom = {bottom_mm:.0f} mm.</text>
+</svg>
+"""
 
 def _station_from_row(old: WallStationInput, row: dict, thickness_mm: float | None = None) -> WallStationInput:
     return WallStationInput(
@@ -496,6 +622,8 @@ if "input_widget_version" not in st.session_state:
     st.session_state.input_widget_version = 0
 if "last_input_view" not in st.session_state:
     st.session_state.last_input_view = "🖼 Graphical Input"
+if "wall_taper_start_pct" not in st.session_state:
+    st.session_state.wall_taper_start_pct = _taper_start_percent(st.session_state.defaults)
 
 
 def apply_recommended_safe_design() -> None:
@@ -659,10 +787,6 @@ if input_view == "🖼 Graphical Input":
                 "Special Cut-off Station Height (m)", min_value=0.0, value=float(base.cutoff_height_m), step=0.05,
                 key=f"g_cutoff_{ui_v}",
             )
-            base.wall_taper_height_m = st.number_input(
-                "Wall Taper Height at Footing (m)", min_value=0.0, value=float(base.wall_taper_height_m), step=0.10,
-                key=f"g_taper_{ui_v}",
-            )
     diagram_slot.markdown(_diagram_shell(
         "Wall / liquid section",
         "Use the numbered callouts to relate RL inputs to the actual wall. Blue indicates retained liquid.",
@@ -724,47 +848,34 @@ if input_view == "🖼 Graphical Input":
 
     divider()
 
-    # ---------- G3. linked thickness profile ----------
+    # ---------- G3. single linked thickness profile ----------
     section_title(3, "Linked Wall Thickness Profile")
     dcol, icol = st.columns([1.1, 1.0], gap="large")
     profile_slot = dcol.empty()
     with icol:
-        st.markdown("#### Wall thickness at each level")
-        st.caption("You may edit any one box. The app automatically applies the same change (Δ) to every station so the approved taper/profile shape is preserved.")
-        station_values = []
-        grid = st.columns(3)
-        for idx, s in enumerate(base.wall_stations):
-            with grid[idx % 3]:
-                station_values.append(st.number_input(
-                    f"{s.label} station (mm)",
-                    min_value=max(50.0, float(base.wall_cover_mm) + 1.0),
-                    value=float(s.provided_thickness_mm),
-                    step=5.0,
-                    format="%.0f",
-                    key=f"g_thk_{idx}_{st.session_state.thickness_widget_version}_{ui_v}",
-                    help="Linked wall thickness input.",
-                ))
+        st.markdown("#### Define the wall profile")
+        st.caption(
+            "Use only three controls. Example: Taper Starts Below = 60% keeps the upper 0–60% at the Top Wall Thickness, "
+            "then uses one linear taper from 60–100% to reach the Bottom Wall Thickness."
+        )
+        _render_wall_profile_controls(base, "g_profile", ui_v)
 
-        baseline = [float(s.provided_thickness_mm) for s in base.wall_stations]
-        diffs = [i for i, (old, new) in enumerate(zip(baseline, station_values)) if abs(old-new) > 1e-9]
-        if diffs:
-            edited_index = diffs[-1]
-            linked_values = linked_wall_thickness_profile(base.wall_stations, edited_index, station_values[edited_index])
-            delta = linked_values[edited_index] - baseline[edited_index]
-            for s, linked in zip(base.wall_stations, linked_values):
-                s.provided_thickness_mm = float(linked)
-            st.session_state.defaults = deepcopy(base)
-            st.session_state.thickness_widget_version += 1
-            st.session_state.recommendation = None
-            st.session_state.linked_profile_notice = (
-                f"Linked wall profile updated from {base.wall_stations[edited_index].label}: {delta:+.0f} mm applied to every wall-thickness station."
-            )
-            st.rerun()
+        schedule_rows = []
+        taper_start = float(st.session_state.wall_taper_start_pct) / 100.0
+        for s in base.wall_stations:
+            f = _station_fraction_from_top(base, s)
+            schedule_rows.append({
+                "Station": s.label,
+                "Height from Top (%)": round(100.0 * f, 1),
+                "Thickness (mm)": round(float(s.provided_thickness_mm), 1),
+                "Zone": "Constant top" if f <= taper_start + 1e-12 else "Single taper",
+            })
+        st.dataframe(pd.DataFrame(schedule_rows), hide_index=True, use_container_width=True)
 
     profile_slot.markdown(_diagram_shell(
         "Wall thickness profile",
-        "The liquid/heel face remains vertical while the opposite/toe face follows the linked thickness profile. Every station remains linked to the approved profile shape.",
-        thickness_profile_svg(base.wall_stations),
+        "The liquid face remains vertical. The opposite face is constant above the taper point and has only one linear taper below it.",
+        thickness_profile_svg(base),
     ), unsafe_allow_html=True)
 
     if st.session_state.linked_profile_notice:
@@ -785,11 +896,11 @@ if input_view == "🖼 Graphical Input":
         st.markdown("#### Enter the footing dimensions")
         fc1, fc2 = st.columns(2)
         base.heel_projection_m = fc1.number_input(
-            "① Heel Projection — Liquid Side (m)", min_value=0.10, value=float(base.heel_projection_m), step=0.05,
+            "① Heel Projection (m)", min_value=0.10, value=float(base.heel_projection_m), step=0.05,
             key=f"g_heel_{ui_v}",
         )
         base.toe_projection_m = fc2.number_input(
-            "② Toe Projection — Outer Side (m)", min_value=0.10, value=float(base.toe_projection_m), step=0.05,
+            "② Toe Projection (m)", min_value=0.10, value=float(base.toe_projection_m), step=0.05,
             key=f"g_toe_{ui_v}",
         )
         fc1, fc2 = st.columns(2)
@@ -807,7 +918,7 @@ if input_view == "🖼 Graphical Input":
         )
     footing_slot.markdown(_diagram_shell(
         "Heel / wall / toe section",
-        "Orientation matches the wall sketch above: retained liquid and HEEL are on the left; the outer TOE is on the right.",
+        "Liquid is shown only as LIQUID SIDE at the wall. HEEL SIDE and TOE SIDE are labelled separately beside the footing projections.",
         footing_svg(base),
     ), unsafe_allow_html=True)
 
@@ -835,7 +946,7 @@ else:
     c1, c2, c3 = st.columns(3)
     base.freeboard_m = c1.number_input("Freeboard Addition (m)", min_value=0.0, value=float(base.freeboard_m), step=0.05, key=f"d_freeboard_{ui_v}")
     base.cutoff_height_m = c2.number_input("Special Cut-off Station Height (m)", min_value=0.0, value=float(base.cutoff_height_m), step=0.05, key=f"d_cutoff_{ui_v}")
-    base.wall_taper_height_m = c3.number_input("Wall Taper Height at Footing (m)", min_value=0.0, value=float(base.wall_taper_height_m), step=0.10, key=f"d_taper_{ui_v}")
+    c3.caption("Wall taper geometry is controlled in Section 3 by Top Thickness, Bottom Thickness and Taper Start %.")
 
     divider()
     section_title(2, "Material Properties & Design Limits")
@@ -868,8 +979,15 @@ else:
 
     divider()
     section_title(3, "Wall Thickness & Reinforcement")
-    st.markdown('<div class="small-note">The wall thickness schedule is linked. Editing one station applies the same thickness change (Δ) to every station.</div>', unsafe_allow_html=True)
-    with st.expander("Advanced wall thickness & reinforcement schedule", expanded=False):
+    st.markdown(
+        '<div class="small-note">Wall thickness is generated from exactly three controls: Top Wall Thickness, Bottom Wall Thickness and Taper Start %. '
+        'The upper wall remains constant and only one linear taper is used below the taper point.</div>',
+        unsafe_allow_html=True,
+    )
+    _render_wall_profile_controls(base, "d_profile", ui_v)
+
+    with st.expander("Advanced wall reinforcement schedule", expanded=False):
+        st.caption("Thickness values are derived and read-only here. Reinforcement remains editable for the engineer/checker.")
         rows = []
         for s in base.wall_stations:
             rows.append({
@@ -881,30 +999,19 @@ else:
             })
         editor_key = f"d_wall_schedule_{st.session_state.thickness_widget_version}_{ui_v}"
         edited = st.data_editor(
-            pd.DataFrame(rows), hide_index=True, use_container_width=True, key=editor_key, disabled=["Station"], num_rows="fixed",
-            column_config={"Thickness (mm)": st.column_config.NumberColumn("Thickness (mm)", min_value=max(50.0, float(base.wall_cover_mm)+1.0), step=5.0, format="%.0f")},
+            pd.DataFrame(rows), hide_index=True, use_container_width=True, key=editor_key,
+            disabled=["Station", "Thickness (mm)"], num_rows="fixed",
+            column_config={"Thickness (mm)": st.column_config.NumberColumn("Thickness (mm)", format="%.1f")},
         )
         recs = edited.to_dict("records")
-        baseline = [float(s.provided_thickness_mm) for s in base.wall_stations]
-        edited_thks = [float(r["Thickness (mm)"]) for r in recs]
-        diffs = [i for i,(old,new) in enumerate(zip(baseline, edited_thks)) if abs(old-new)>1e-9]
-        if diffs:
-            editor_state = st.session_state.get(editor_key, {})
-            edited_rows_state = editor_state.get("edited_rows", {}) if isinstance(editor_state, dict) else {}
-            changed = [int(i) for i, changes in edited_rows_state.items() if isinstance(changes, dict) and "Thickness (mm)" in changes]
-            edited_index = changed[-1] if changed else diffs[-1]
-            linked_values = linked_wall_thickness_profile(base.wall_stations, edited_index, edited_thks[edited_index])
-            delta = linked_values[edited_index] - baseline[edited_index]
-            base.wall_stations = [_station_from_row(old, row, linked) for old,row,linked in zip(base.wall_stations,recs,linked_values)]
-            st.session_state.defaults = deepcopy(base)
-            st.session_state.thickness_widget_version += 1
-            st.session_state.recommendation = None
-            st.session_state.linked_profile_notice = f"Linked wall profile updated from {base.wall_stations[edited_index].label}: {delta:+.0f} mm applied to every station."
-            st.rerun()
-        base.wall_stations = [_station_from_row(old,row,float(row["Thickness (mm)"])) for old,row in zip(base.wall_stations,recs)]
+        base.wall_stations = [
+            _station_from_row(old, row, float(old.provided_thickness_mm))
+            for old, row in zip(base.wall_stations, recs)
+        ]
     if st.session_state.linked_profile_notice:
         st.info(st.session_state.linked_profile_notice)
         st.session_state.linked_profile_notice = None
+
     bottom_input = base.wall_stations[-1]
     q1,q2,q3,q4 = st.columns(4)
     q1.metric("Bottom Wall Thickness", f"{bottom_input.provided_thickness_mm:.0f} mm")
