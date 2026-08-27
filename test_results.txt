@@ -1,0 +1,2 @@
+17 passed
+Graphical Input / Detailed Input UI contract, linked thickness profile, multi-code engine, optimiser, asymmetric heel/toe geometry, compact PDF and reports verified by automated tests.
