@@ -66,7 +66,9 @@ class DesignInputs:
     freeboard_m: float = 0.0
     wall_cover_mm: float = 45.0
     cutoff_height_m: float = 4.50
-    wall_taper_height_m: float = 2.40
+    bottom_wall_thickness_mm: float = 400.0
+    top_wall_thickness_mm: float = 200.0
+    taper_from_bottom_percent: float = 37.5
 
     # Footing geometry
     toe_projection_m: float = 1.65
