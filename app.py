@@ -468,7 +468,90 @@ def thickness_profile_svg(inp) -> str:
 """
 
 
+def _apply_wall_rebar_table_rules(baseline_rows: list[dict], edited_rows: list[dict]) -> tuple[list[dict], list[str]]:
+    """Apply the approved W1 reinforcement-table linkage rules.
+
+    Station order is top -> bottom (0% -> 100%). Therefore "above" means rows
+    with a smaller index. The function is intentionally UI-only: it changes the
+    reinforcement schedule entered by the user but does not alter design formulas.
+    """
+    result = deepcopy(baseline_rows)
+    messages: list[str] = []
+    editable_columns = [
+        "Vertical Main Dia (mm)",
+        "Vertical Main Spacing (mm)",
+        "Vertical Extra Dia (mm)",
+        "Vertical Extra Spacing (mm)",
+        "Horizontal Dia (mm)",
+        "Horizontal Spacing (mm)",
+        "Corner Dia (mm)",
+    ]
+
+    changed: list[tuple[int, str, float]] = []
+    for idx, (before, after) in enumerate(zip(baseline_rows, edited_rows)):
+        for col in editable_columns:
+            old = float(before[col])
+            new = float(after[col])
+            if abs(old - new) > 1e-9:
+                changed.append((idx, col, new))
+
+    # Process lower-row edits first. If several cells are pasted at once, a later
+    # upper-row edit can then form its own band without being overwritten.
+    changed.sort(key=lambda item: item[0], reverse=True)
+
+    for idx, col, value in changed:
+        result[idx][col] = value
+
+        if col == "Vertical Main Dia (mm)":
+            for j in range(0, idx + 1):
+                result[j][col] = value
+            messages.append(f"Vertical main dia Ø{value:g} propagated from {baseline_rows[idx]['Station']} upward.")
+
+        elif col == "Vertical Main Spacing (mm)":
+            for j in range(0, idx + 1):
+                result[j][col] = value
+            messages.append(f"Vertical main spacing {value:g} mm propagated from {baseline_rows[idx]['Station']} upward.")
+
+        elif col == "Vertical Extra Dia (mm)":
+            # Preserve every zero-diameter location. A non-zero edit only updates
+            # existing non-zero extra-bar rows above the edited station.
+            if value > 0:
+                for j in range(0, idx + 1):
+                    if float(baseline_rows[j][col]) > 0:
+                        result[j][col] = value
+                messages.append(
+                    f"Vertical extra dia Ø{value:g} propagated upward through non-zero extra-bar rows; zero rows were preserved."
+                )
+
+        elif col == "Vertical Extra Spacing (mm)":
+            for j in range(0, idx + 1):
+                result[j][col] = value
+            messages.append(f"Vertical extra spacing {value:g} mm propagated from {baseline_rows[idx]['Station']} upward.")
+
+        elif col == "Corner Dia (mm)":
+            # Excel uses separate corner-diameter bands (currently upper Ø8 and
+            # lower Ø10). Propagate upward only inside the edited row's existing
+            # contiguous band, so a lower-band change cannot overwrite the upper band.
+            original_band_value = float(baseline_rows[idx][col])
+            result[idx][col] = value
+            j = idx - 1
+            while j >= 0 and abs(float(baseline_rows[j][col]) - original_band_value) <= 1e-9:
+                result[j][col] = value
+                j -= 1
+            messages.append(
+                f"Corner dia Ø{value:g} propagated upward within the {original_band_value:g} mm corner-dia band only."
+            )
+
+    # Direct horizontal-main edits remain station-specific. The Excel relation for
+    # corner spacing is exact: Corner Spacing = 2 x Horizontal Spacing at each row.
+    for row in result:
+        row["Corner Spacing (mm)"] = 2.0 * float(row["Horizontal Spacing (mm)"])
+
+    return result, messages
+
+
 def _station_from_row(old: WallStationInput, row: dict, thickness_mm: float | None = None) -> WallStationInput:
+    horizontal_spacing = float(row["Horizontal Spacing (mm)"])
     return WallStationInput(
         label=old.label,
         fraction=old.fraction,
@@ -476,12 +559,16 @@ def _station_from_row(old: WallStationInput, row: dict, thickness_mm: float | No
         provided_thickness_mm=float(old.provided_thickness_mm if thickness_mm is None else thickness_mm),
         vertical_main=RebarLayer(float(row["Vertical Main Dia (mm)"]), float(row["Vertical Main Spacing (mm)"])),
         vertical_extra=RebarLayer(float(row["Vertical Extra Dia (mm)"]), float(row["Vertical Extra Spacing (mm)"])),
-        horizontal_main=RebarLayer(float(row["Horizontal Dia (mm)"]), float(row["Horizontal Spacing (mm)"])),
-        horizontal_corner=RebarLayer(float(row["Corner Dia (mm)"]), float(row["Corner Spacing (mm)"])),
+        horizontal_main=RebarLayer(float(row["Horizontal Dia (mm)"]), horizontal_spacing),
+        horizontal_corner=RebarLayer(float(row["Corner Dia (mm)"]), 2.0 * horizontal_spacing),
     )
 
 
 def _wall_rebar_editor(inp, key: str) -> None:
+    # Always reconcile the derived corner spacing before presenting the table.
+    for s in inp.wall_stations:
+        s.horizontal_corner.spacing_mm = 2.0 * float(s.horizontal_main.spacing_mm)
+
     rows = []
     for s in inp.wall_stations:
         rows.append({
@@ -493,14 +580,31 @@ def _wall_rebar_editor(inp, key: str) -> None:
             "Horizontal Dia (mm)": s.horizontal_main.dia_mm,
             "Horizontal Spacing (mm)": s.horizontal_main.spacing_mm,
             "Corner Dia (mm)": s.horizontal_corner.dia_mm,
-            "Corner Spacing (mm)": s.horizontal_corner.spacing_mm,
+            "Corner Spacing (mm)": 2.0 * s.horizontal_main.spacing_mm,
         })
+
+    editor_key = f"{key}_{st.session_state.wall_rebar_widget_version}"
     edited = st.data_editor(
-        pd.DataFrame(rows), hide_index=True, use_container_width=True, key=key,
-        disabled=["Station"], num_rows="fixed",
+        pd.DataFrame(rows), hide_index=True, use_container_width=True, key=editor_key,
+        disabled=["Station", "Corner Spacing (mm)"], num_rows="fixed",
+        column_config={
+            "Corner Spacing (mm)": st.column_config.NumberColumn(
+                "Corner Spacing (mm)",
+                help="Derived automatically from Excel relation: 2 × Horizontal Spacing.",
+                format="%.0f",
+            ),
+        },
     )
     recs = edited.to_dict("records")
-    inp.wall_stations = [_station_from_row(old, row) for old, row in zip(inp.wall_stations, recs)]
+    linked_rows, messages = _apply_wall_rebar_table_rules(rows, recs)
+    inp.wall_stations = [_station_from_row(old, row) for old, row in zip(inp.wall_stations, linked_rows)]
+
+    if messages:
+        st.session_state.defaults = deepcopy(inp)
+        st.session_state.wall_rebar_widget_version += 1
+        st.session_state.recommendation = None
+        st.session_state.wall_rebar_notice = " ".join(dict.fromkeys(messages))
+        st.rerun()
 
 
 def _render_fixed_parameters(inp) -> None:
@@ -537,6 +641,10 @@ if "input_widget_version" not in st.session_state:
     st.session_state.input_widget_version = 0
 if "last_input_view" not in st.session_state:
     st.session_state.last_input_view = "🖼 Graphical Input"
+if "wall_rebar_widget_version" not in st.session_state:
+    st.session_state.wall_rebar_widget_version = 0
+if "wall_rebar_notice" not in st.session_state:
+    st.session_state.wall_rebar_notice = None
 
 
 def apply_recommended_safe_design() -> None:
@@ -828,9 +936,16 @@ if input_view == "🖼 Graphical Input":
         st.info(st.session_state.linked_profile_notice)
         st.session_state.linked_profile_notice = None
 
-    with st.expander("🧰 Advanced wall reinforcement — engineer / checker use", expanded=False):
+    with st.expander(
+        "🧰 Advanced wall reinforcement — engineer / checker use",
+        expanded=bool(st.session_state.wall_rebar_notice),
+    ):
         st.caption("A draftsman normally does not need to change this table unless instructed by the designer.")
+        st.caption("Linked rules: vertical edits propagate upward as specified; corner spacing is read-only and equals 2 × horizontal spacing.")
         _wall_rebar_editor(base, key=f"g_wall_rebar_{ui_v}")
+    if st.session_state.wall_rebar_notice:
+        st.success(st.session_state.wall_rebar_notice)
+        st.session_state.wall_rebar_notice = None
 
     divider()
 
@@ -946,14 +1061,21 @@ else:
         f"Taper height = {dg['taper_height_m']:.3f} m. Upper wall remains constant at "
         f"{dg['top_thickness_mm']:.0f} mm above the taper termination."
     )
-    with st.expander("Derived wall thickness schedule + reinforcement", expanded=False):
+    with st.expander(
+        "Derived wall thickness schedule + reinforcement",
+        expanded=bool(st.session_state.wall_rebar_notice),
+    ):
         st.dataframe(
             pd.DataFrame([{
                 "Station": sg["label"],
                 "Derived Thickness (mm)": round(sg["thickness_mm"], 1),
             } for sg in dg["stations"]]), hide_index=True, use_container_width=True,
         )
+        st.caption("Linked reinforcement rules follow the reconciled Excel table; corner spacing is derived as 2 × horizontal spacing.")
         _wall_rebar_editor(base, key=f"d_wall_rebar_{ui_v}")
+    if st.session_state.wall_rebar_notice:
+        st.success(st.session_state.wall_rebar_notice)
+        st.session_state.wall_rebar_notice = None
     if st.session_state.linked_profile_notice:
         st.info(st.session_state.linked_profile_notice)
         st.session_state.linked_profile_notice = None
