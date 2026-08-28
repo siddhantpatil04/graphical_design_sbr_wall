@@ -53,10 +53,96 @@ def default_wall_stations() -> list[WallStationInput]:
     ]
 
 
+def linked_wall_thickness_at_height(
+    y_from_bottom_m: float, wall_height_m: float, bottom_thickness_mm: float,
+    top_thickness_mm: float, taper_from_bottom_percent: float,
+) -> float:
+    """Thickness at height y measured upward from the wall bottom.
+
+    One and only one taper zone is permitted: the lower P percent of the wall.
+    Above the taper termination point the wall remains at the user-entered top
+    thickness. P=0 intentionally produces a constant top-thickness wall.
+    """
+    h = max(float(wall_height_m), 0.0)
+    tb = float(bottom_thickness_mm)
+    tt = float(top_thickness_mm)
+    p = min(max(float(taper_from_bottom_percent), 0.0), 100.0)
+    y = min(max(float(y_from_bottom_m), 0.0), h)
+    if h <= 1e-12 or p <= 1e-12 or abs(tb - tt) <= 1e-12:
+        return tt
+    htaper = h * p / 100.0
+    if y >= htaper:
+        return tt
+    return tb - (tb - tt) * (y / htaper)
+
+
+def build_linked_wall_geometry(inp: DesignInputs) -> dict:
+    """Single source of truth for the linked wall profile and station thicknesses.
+
+    Existing W1 station fractions are measured from the wall top downward; the
+    user-entered taper percentage is measured upward from the wall bottom. This
+    helper reconciles those conventions without changing the pressure/rebar
+    station definitions used by the calculation engine.
+    """
+    footing_haunch_m = inp.footing_total_thickness_m - inp.footing_edge_thickness_m
+    wall_bottom_rl_m = inp.raft_top_rl_m + footing_haunch_m
+    wall_height_m = max(inp.wall_top_rl_m - wall_bottom_rl_m, 0.0)
+    taper_percent = min(max(float(inp.taper_from_bottom_percent), 0.0), 100.0)
+    taper_height_m = wall_height_m * taper_percent / 100.0
+    taper_end_rl_m = wall_bottom_rl_m + taper_height_m
+
+    station_geometry = []
+    for s in inp.wall_stations:
+        if s.label == "Cut-off":
+            depth_from_top_m = float(inp.cutoff_height_m)
+        elif s.fraction is None:
+            depth_from_top_m = float(s.special_height_m or 0.0)
+        else:
+            depth_from_top_m = wall_height_m * float(s.fraction)
+        depth_from_top_clamped_m = min(max(depth_from_top_m, 0.0), wall_height_m)
+        y_from_bottom_m = wall_height_m - depth_from_top_clamped_m
+        thickness_mm = linked_wall_thickness_at_height(
+            y_from_bottom_m, wall_height_m, inp.bottom_wall_thickness_mm,
+            inp.top_wall_thickness_mm, taper_percent,
+        )
+        station_geometry.append({
+            "label": s.label,
+            "depth_from_top_m": depth_from_top_m,
+            "height_from_bottom_m": y_from_bottom_m,
+            "thickness_mm": thickness_mm,
+        })
+
+    effective_bottom_thickness_mm = linked_wall_thickness_at_height(
+        0.0, wall_height_m, inp.bottom_wall_thickness_mm, inp.top_wall_thickness_mm, taper_percent
+    )
+    return {
+        "wall_bottom_rl_m": wall_bottom_rl_m,
+        "wall_height_m": wall_height_m,
+        "bottom_thickness_input_mm": float(inp.bottom_wall_thickness_mm),
+        "bottom_thickness_mm": effective_bottom_thickness_mm,
+        "top_thickness_mm": float(inp.top_wall_thickness_mm),
+        "taper_from_bottom_percent": taper_percent,
+        "taper_height_m": taper_height_m,
+        "taper_end_rl_m": taper_end_rl_m,
+        "stations": station_geometry,
+    }
+
+
+def synchronise_linked_wall_thickness(inp: DesignInputs) -> dict:
+    """Populate station thicknesses from the three linked-wall geometry inputs."""
+    geometry = build_linked_wall_geometry(inp)
+    by_label = {g["label"]: g["thickness_mm"] for g in geometry["stations"]}
+    for s in inp.wall_stations:
+        s.provided_thickness_mm = float(by_label[s.label])
+    return geometry
+
+
 def default_inputs() -> DesignInputs:
     d = DesignInputs()
     d.wall_stations = default_wall_stations()
+    synchronise_linked_wall_thickness(d)
     return d
+
 
 
 def _bar_area(layers: Iterable[RebarLayer]) -> float:
@@ -267,8 +353,12 @@ def validate_inputs(inp: DesignInputs) -> list[str]:
         errors.append("Water top RL cannot exceed wall top RL for this calculation scope.")
     if inp.footing_total_thickness_m < inp.footing_edge_thickness_m:
         errors.append("Total footing thickness must be at least the edge thickness.")
-    if inp.wall_taper_height_m < 0:
-        errors.append("Wall taper height cannot be negative.")
+    if inp.bottom_wall_thickness_mm <= 0 or inp.top_wall_thickness_mm <= 0:
+        errors.append("Bottom and top wall thickness must be greater than zero.")
+    if inp.bottom_wall_thickness_mm + 1e-9 < inp.top_wall_thickness_mm:
+        errors.append("Bottom wall thickness must be greater than or equal to top wall thickness for the implemented single-taper profile.")
+    if not (0.0 <= inp.taper_from_bottom_percent <= 100.0):
+        errors.append("Taper From Bottom (%) must be between 0 and 100.")
     if not inp.wall_stations:
         errors.append("Wall station schedule is empty.")
     for s in inp.wall_stations:
@@ -286,6 +376,7 @@ def validate_inputs(inp: DesignInputs) -> list[str]:
 def calculate(inputs: DesignInputs) -> DesignResult:
     inp = deepcopy(inputs)
     inp.design_method = normalise_method(inp.design_code, inp.design_method)
+    geometry = synchronise_linked_wall_thickness(inp)
     errors = validate_inputs(inp)
     if errors:
         raise ValueError("; ".join(errors))
@@ -296,11 +387,16 @@ def calculate(inputs: DesignInputs) -> DesignResult:
     traces: list[FormulaTrace] = []
     checks: list[CheckResult] = []
     warnings: list[str] = list(prof.notes)
+    if geometry["taper_from_bottom_percent"] <= 1e-12 and abs(inp.bottom_wall_thickness_mm - inp.top_wall_thickness_mm) > 1e-9:
+        warnings.append(
+            "Taper From Bottom is 0%; the complete wall uses the user-entered Top Wall Thickness. "
+            "The Bottom Wall Thickness input is retained for traceability but is not geometrically active in this edge case."
+        )
 
-    wall_top_thk_m = inp.wall_stations[0].provided_thickness_mm / 1000.0
-    wall_base_thk_m = inp.wall_stations[-1].provided_thickness_mm / 1000.0
+    wall_top_thk_m = geometry["top_thickness_mm"] / 1000.0
+    wall_base_thk_m = geometry["bottom_thickness_mm"] / 1000.0
     footing_haunch_m = inp.footing_total_thickness_m - inp.footing_edge_thickness_m
-    side_wall_bottom_rl = inp.raft_top_rl_m + footing_haunch_m
+    side_wall_bottom_rl = geometry["wall_bottom_rl_m"]
     liquid_depth = max(0.0, inp.water_top_rl_m - side_wall_bottom_rl + inp.freeboard_m)
     total_wall_depth = inp.wall_top_rl_m - side_wall_bottom_rl
     dry_height = inp.wall_top_rl_m - inp.water_top_rl_m
@@ -320,6 +416,12 @@ def calculate(inputs: DesignInputs) -> DesignResult:
                      f"{liquid_depth:.3f} m", "WALL W1!H164"),
         FormulaTrace("Total wall depth", "H = RLwall,top - RLbottom",
                      f"{inp.wall_top_rl_m:.3f} - {side_wall_bottom_rl:.3f}", f"{total_wall_depth:.3f} m", "WALL W1!H167"),
+        FormulaTrace("Linked wall bottom thickness", "Tb = user input",
+                     f"Tb = {inp.bottom_wall_thickness_mm:.1f}", f"{geometry['bottom_thickness_mm']:.1f} mm", "Linked wall geometry"),
+        FormulaTrace("Linked wall top thickness", "Tt = user input",
+                     f"Tt = {inp.top_wall_thickness_mm:.1f}", f"{inp.top_wall_thickness_mm:.1f} mm", "Linked wall geometry"),
+        FormulaTrace("Linked wall taper height", "Htaper = H x P / 100",
+                     f"{total_wall_depth:.3f} x {inp.taper_from_bottom_percent:.2f} / 100", f"{geometry['taper_height_m']:.3f} m", "Linked wall geometry"),
     ])
     if is_lsm:
         traces.append(FormulaTrace("Bending coefficient", "Q = 0.1327258645 fck",
@@ -482,7 +584,7 @@ def calculate(inputs: DesignInputs) -> DesignResult:
     overturning_m = ot_force * (liquid_depth/3.0 + total_t)
     W1 = bwall_top * total_wall_depth * inp.gamma_concrete_kn_m3
     la1 = toe + taper_delta + bwall_top/2.0
-    W2 = 0.5 * taper_delta * inp.wall_taper_height_m * inp.gamma_concrete_kn_m3
+    W2 = 0.5 * taper_delta * geometry["taper_height_m"] * inp.gamma_concrete_kn_m3
     la2 = toe + (2.0/3.0)*taper_delta if abs(taper_delta) > 1e-12 else toe
     W3 = base_width * edge_t * inp.gamma_concrete_kn_m3
     la3 = base_width/2.0
@@ -730,31 +832,11 @@ def calculate(inputs: DesignInputs) -> DesignResult:
     )
 
 
-def linked_wall_thickness_profile(
-    stations: list[WallStationInput], edited_index: int, edited_thickness_mm: float
-) -> list[float]:
-    """Return a linked wall-thickness schedule after one station is edited.
-
-    The approved station-to-station profile is preserved exactly by applying the same
-    additive thickness change (delta) to every station. This matches the thickness-only
-    optimiser, keeps the taper/plateau shape unchanged, and ensures all linked values
-    remain visible and auditable in the UI.
-    """
-    if not stations:
-        raise ValueError("Wall station schedule is empty.")
-    if edited_index < 0 or edited_index >= len(stations):
-        raise IndexError("Edited wall-station index is outside the schedule.")
-    if edited_thickness_mm <= 0:
-        raise ValueError("Edited wall thickness must be greater than zero.")
-    delta = float(edited_thickness_mm) - float(stations[edited_index].provided_thickness_mm)
-    return [float(s.provided_thickness_mm) + delta for s in stations]
-
-
 def recommend_safe_thickness(inp: DesignInputs, step_mm: int = 25, max_increase_mm: int = 500) -> dict:
     """Thickness-only optimiser using the currently selected code and method."""
     baseline = calculate(inp)
     if baseline.overall_status == "SAFE":
-        return {"found": True, "already_safe": True, "inputs": inp, "result": baseline,
+        return {"found": True, "already_safe": True, "inputs": baseline.inputs, "result": baseline,
                 "wall_increase_mm": 0, "footing_increase_mm": 0, "governing_failed_checks": []}
     failures = [c.name for c in baseline.failed_checks()]
     increments = list(range(0, max_increase_mm + step_mm, step_mm))
@@ -763,8 +845,9 @@ def recommend_safe_thickness(inp: DesignInputs, step_mm: int = 25, max_increase_
     for wall_inc, foot_inc in candidates:
         trial = deepcopy(inp)
         if wall_inc:
-            for s in trial.wall_stations:
-                s.provided_thickness_mm += wall_inc
+            trial.bottom_wall_thickness_mm += wall_inc
+            trial.top_wall_thickness_mm += wall_inc
+            synchronise_linked_wall_thickness(trial)
         if foot_inc:
             trial.footing_total_thickness_m += foot_inc/1000.0
         try:
